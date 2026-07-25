@@ -145,7 +145,6 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._turn_counter = 0
 
         self._session_turns: list[str] = []
-        self._cancel_debounce_timer()
         self._debounce_timer: threading.Timer | None = None
 
         # Prefetch state
