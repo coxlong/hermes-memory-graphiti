@@ -32,7 +32,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
-from graphiti_core.nodes import EpisodeType
 from tools.registry import tool_error
 
 from .config import _DEFAULT_HOST, _DEFAULT_PORT, _DEFAULT_DATABASE, _DEFAULT_MEMORY_MODE
@@ -480,7 +479,7 @@ class GraphitiMemoryProvider(MemoryProvider):
                 self._graphiti.add_episode(
                     name=f"turn-{now.strftime('%Y%m%d-%H%M%S')}",
                     episode_body=content,
-                    source=EpisodeType.message,
+                    source='message',
                     source_description="Hermes Agent conversation",
                     reference_time=now,
                     group_id=database,
@@ -602,7 +601,7 @@ class GraphitiMemoryProvider(MemoryProvider):
                 self._graphiti.add_episode(
                     name=f"session-end-{now.strftime('%Y%m%d-%H%M%S')}",
                     episode_body=content,
-                    source=EpisodeType.message,
+                    source='message',
                     source_description="Hermes Agent session end",
                     reference_time=now,
                     group_id=database,
