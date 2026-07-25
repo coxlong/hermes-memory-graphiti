@@ -14,3 +14,6 @@ dependencies = [
 
 [project.entry-points."hermes_agent.plugins"]
 graphiti = "hermes_graphiti"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermes_graphiti"]
