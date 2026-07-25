@@ -190,6 +190,15 @@ class GraphitiMemoryProvider(MemoryProvider):
         from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
         from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 
+        # Fix: graphiti-core's default appends "... Only output non-English
+        # text when full sentences ... Otherwise, output English" — this gives
+        # the LLM room to default to English. Strip the loophole, keep the rule.
+        import graphiti_core.llm_client.openai_generic_client as _ogc
+        _ogc.get_extraction_language_instruction = lambda group_id=None: (
+            '\n\nAny extracted information should be returned in the same '
+            'language as it was written in.'
+        )
+
         self._session_id = str(session_id or "").strip()
         self._platform = str(kwargs.get("platform") or "").strip()
         self._turn_index = 0
