@@ -14,7 +14,6 @@ Config via environment variables:
   GRAPHITI_LLM_MODEL              — LLM model (blank = provider default)
   GRAPHITI_LLM_BASE_URL           — Custom LLM endpoint URL
   GRAPHITI_MEMORY_MODE            — context, tools, or hybrid (default: hybrid)
-  GRAPHITI_AUTO_RECALL            — auto-recall before each turn (default: true)
   GRAPHITI_AUTO_RETAIN            — auto-retain turns as episodes (default: true)
 
 Or via $HERMES_HOME/graphiti/config.json (profile-scoped).
@@ -132,7 +131,6 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._llm_model = ""
         self._llm_base_url = ""
         self._memory_mode = _DEFAULT_MEMORY_MODE
-        self._auto_recall = True
         self._auto_retain = True
         self._recall_max_tokens = _DEFAULT_RECALL_MAX_TOKENS
 
@@ -222,7 +220,6 @@ class GraphitiMemoryProvider(MemoryProvider):
         if self._memory_mode not in {"context", "tools", "hybrid"}:
             self._memory_mode = _DEFAULT_MEMORY_MODE
 
-        self._auto_recall = self._config.get("auto_recall", True)
         self._auto_retain = self._config.get("auto_retain", True)
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", _DEFAULT_RECALL_MAX_TOKENS))
 
@@ -268,9 +265,9 @@ class GraphitiMemoryProvider(MemoryProvider):
         )
 
         logger.info(
-            "Graphiti initialized: host=%s:%d db=%s provider=%s mode=%s auto_recall=%s auto_retain=%s",
+            "Graphiti initialized: host=%s:%d db=%s provider=%s mode=%s auto_retain=%s",
             self._falkordb_host, self._falkordb_port, self._falkordb_database,
-            self._llm_provider, self._memory_mode, self._auto_recall, self._auto_retain,
+            self._llm_provider, self._memory_mode, self._auto_retain,
         )
 
         # Build indices on init (idempotent — skips if already exist)
@@ -350,8 +347,6 @@ class GraphitiMemoryProvider(MemoryProvider):
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
-            return
-        if not self._auto_recall:
             return
         if self._shutting_down.is_set():
             return

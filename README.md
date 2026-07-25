@@ -38,7 +38,6 @@ Or configure manually in `$HERMES_HOME/graphiti/config.json`:
   "llm_provider": "openai",
   "llm_model": "gpt-4o-mini",
   "memory_mode": "hybrid",
-  "auto_recall": true,
   "auto_retain": true
 }
 ```
@@ -71,7 +70,6 @@ GRAPHITI_FALKORDB_PASSWORD=...
 | `GRAPHITI_LLM_MODEL` | LLM model | — |
 | `GRAPHITI_LLM_BASE_URL` | Custom LLM endpoint URL | — |
 | `GRAPHITI_MEMORY_MODE` | `context` / `tools` / `hybrid` | `hybrid` |
-| `GRAPHITI_AUTO_RECALL` | Auto-recall before each turn | `true` |
 | `GRAPHITI_AUTO_RETAIN` | Auto-retain turns as episodes | `true` |
 
 ## How it works

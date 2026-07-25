@@ -47,7 +47,6 @@ def _load_config() -> dict:
         "llm_base_url": os.environ.get("GRAPHITI_LLM_BASE_URL", ""),
         "embedding_model": os.environ.get("GRAPHITI_EMBEDDING_MODEL", ""),
         "memory_mode": os.environ.get("GRAPHITI_MEMORY_MODE", _DEFAULT_MEMORY_MODE),
-        "auto_recall": os.environ.get("GRAPHITI_AUTO_RECALL", "true").lower() != "false",
         "auto_retain": os.environ.get("GRAPHITI_AUTO_RETAIN", "true").lower() != "false",
         "recall_max_tokens": int(os.environ.get("GRAPHITI_RECALL_MAX_TOKENS", "4096")),
     }
@@ -118,11 +117,6 @@ def get_config_schema() -> list[dict[str, Any]]:
             "description": "How Graphiti integrates with the agent",
             "default": _DEFAULT_MEMORY_MODE,
             "choices": ["context", "tools", "hybrid"],
-        },
-        {
-            "key": "auto_recall",
-            "description": "Automatically search and inject memories before each turn",
-            "default": True,
         },
         {
             "key": "auto_retain",
