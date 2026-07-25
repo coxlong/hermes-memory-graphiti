@@ -590,7 +590,11 @@ class GraphitiMemoryProvider(MemoryProvider):
     # -- Optional hooks ------------------------------------------------------
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Cancel timer and flush remaining turns."""
+        """Cancel timer and enqueue remaining turns — non-blocking.
+
+        Uses the same writer queue as sync_turn so shutdown can drain it.
+        Must NOT block on the LLM call — /reset waits for this hook to return.
+        """
         if self._shutting_down.is_set():
             return
         self._cancel_debounce_timer()
@@ -598,24 +602,26 @@ class GraphitiMemoryProvider(MemoryProvider):
             return
 
         content = "\n".join(list(self._session_turns))
-        snapshot_session = self._session_id
-        database = self._group_id
+        logger.info("Graphiti session-end enqueuing %d turns", len(self._session_turns))
 
         def _flush():
             from graphiti_core.nodes import EpisodeType
 
             now = datetime.now(timezone.utc)
-            _run_sync(
-                self._graphiti.add_episode(
-                    name=f"session-end-{now.strftime('%Y%m%d-%H%M%S')}",
-                    episode_body=content,
-                    source=EpisodeType.message,
-                    source_description="Hermes Agent session end",
-                    reference_time=now,
-                    group_id=database,
+            try:
+                _run_sync(
+                    self._graphiti.add_episode(
+                        name=f"session-end-{now.strftime('%Y%m%d-%H%M%S')}",
+                        episode_body=content,
+                        source=EpisodeType.message,
+                        source_description="Hermes Agent session end",
+                        reference_time=now,
+                        group_id=self._group_id,
+                    ),
                 )
-            )
-            logger.debug("Graphiti session-end flush succeeded (session=%s)", snapshot_session)
+                logger.info("Graphiti session-end flush succeeded (session=%s)", self._session_id)
+            except Exception as exc:
+                logger.warning("Graphiti session-end flush failed: %s", exc)
 
         self._ensure_writer()
         self._retain_queue.put(_flush)
