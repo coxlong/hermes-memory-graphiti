@@ -3,6 +3,7 @@ version: 0.1.0
 description: "Graphiti — temporal knowledge graph memory with FalkorDB. Records entities and relationships with timeline awareness."
 pip_dependencies:
   - "graphiti-core>=0.25.0"
+  - "falkordb"
 requires_env: []
 hooks:
   - on_session_end
