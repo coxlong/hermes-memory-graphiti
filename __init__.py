@@ -472,13 +472,14 @@ class GraphitiMemoryProvider(MemoryProvider):
 
         def _do_retain():
             from datetime import timezone as tz
+            from graphiti_core.nodes import EpisodeType
 
             now = datetime.now(tz.utc)
             _run_sync(
                 self._graphiti.add_episode(
                     name=f"turn-{now.strftime('%Y%m%d-%H%M%S')}",
                     episode_body=content,
-                    source='message',
+                    source=EpisodeType.message,
                     source_description="Hermes Agent conversation",
                     reference_time=now,
                     group_id=database,
@@ -595,12 +596,14 @@ class GraphitiMemoryProvider(MemoryProvider):
         database = self._group_id
 
         def _flush():
+            from graphiti_core.nodes import EpisodeType
+
             now = datetime.now(timezone.utc)
             _run_sync(
                 self._graphiti.add_episode(
                     name=f"session-end-{now.strftime('%Y%m%d-%H%M%S')}",
                     episode_body=content,
-                    source='message',
+                    source=EpisodeType.message,
                     source_description="Hermes Agent session end",
                     reference_time=now,
                     group_id=database,
