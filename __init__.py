@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from graphiti_core.nodes import EpisodeType
 from tools.registry import tool_error
 
 from .config import _DEFAULT_HOST, _DEFAULT_PORT, _DEFAULT_DATABASE, _DEFAULT_MEMORY_MODE
@@ -133,6 +134,9 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._llm_base_url = ""
         self._memory_mode = _DEFAULT_MEMORY_MODE
         self._auto_retain = True
+        self._retain_every_n_turns = 10
+        self._retain_min_interval_seconds = 300
+        self._extraction_language_instruction = ""
         self._recall_max_tokens = _DEFAULT_RECALL_MAX_TOKENS
 
         self._graphiti = None
@@ -140,7 +144,10 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._platform = ""
         self._turn_index = 0
         self._turn_counter = 0
+
         self._session_turns: list[str] = []
+        self._cancel_debounce_timer()
+        self._debounce_timer: threading.Timer | None = None
 
         # Prefetch state
         self._prefetch_result = ""
@@ -190,19 +197,19 @@ class GraphitiMemoryProvider(MemoryProvider):
         from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
         from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 
-        # Fix: graphiti-core's default appends "... Only output non-English
-        # text when full sentences ... Otherwise, output English" — this gives
-        # the LLM room to default to English. Strip the loophole, keep the rule.
-        import graphiti_core.llm_client.openai_generic_client as _ogc
-        _ogc.get_extraction_language_instruction = lambda group_id=None: (
-            '\n\nAny extracted information should be returned in the same '
-            'language as it was written in.'
-        )
+        # Optionally override graphiti-core's extraction language instruction.
+        # Default is empty — uses graphiti-core built-in.  Set to a custom
+        # string in config to control what language entities/edges are output in.
+        if self._extraction_language_instruction:
+            import graphiti_core.llm_client.openai_generic_client as _ogc
+            instruction = self._extraction_language_instruction
+            _ogc.get_extraction_language_instruction = lambda group_id=None: instruction
 
         self._session_id = str(session_id or "").strip()
         self._platform = str(kwargs.get("platform") or "").strip()
         self._turn_index = 0
         self._turn_counter = 0
+
         self._session_turns = []
 
         # Load config
@@ -234,6 +241,13 @@ class GraphitiMemoryProvider(MemoryProvider):
             self._memory_mode = _DEFAULT_MEMORY_MODE
 
         self._auto_retain = self._config.get("auto_retain", True)
+        self._retain_every_n_turns = max(1, int(self._config.get("retain_every_n_turns", 10)))
+        self._retain_min_interval_seconds = int(
+            self._config.get("retain_min_interval_seconds", 300)
+        )
+        self._extraction_language_instruction = str(
+            self._config.get("extraction_language_instruction", "")
+        ).strip()
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", _DEFAULT_RECALL_MAX_TOKENS))
 
         # Set OpenAI api key in env for graphiti-core to pick up
@@ -312,6 +326,7 @@ class GraphitiMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         logger.debug("Graphiti shutdown: stopping writer + closing connection")
+        self._cancel_debounce_timer()
         self._shutting_down.set()
 
         # Drain the writer
@@ -392,13 +407,8 @@ class GraphitiMemoryProvider(MemoryProvider):
     # -- Sync turn (retain) -------------------------------------------------
 
     def _build_turn_content(self, user_content: str, assistant_content: str) -> str:
-        return json.dumps(
-            [
-                {"role": "user", "content": user_content, "timestamp": _utc_timestamp()},
-                {"role": "assistant", "content": assistant_content, "timestamp": _utc_timestamp()},
-            ],
-            ensure_ascii=False,
-        )
+        # Format as "User: xxx\nAssistant: xxx" for Graphiti's extract_message prompt
+        return f"User: {user_content}\nAssistant: {assistant_content}"
 
     def _ensure_writer(self) -> None:
         thread = self._writer_thread
@@ -443,6 +453,67 @@ class GraphitiMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Graphiti atexit shutdown failed: %s", exc)
 
+    def _cancel_debounce_timer(self) -> None:
+        if self._debounce_timer is not None:
+            logger.debug("Graphiti debounce timer cancelled (%ds)",
+                         self._retain_min_interval_seconds)
+            self._debounce_timer.cancel()
+            self._debounce_timer = None
+
+    def _flush_pending_turns(self) -> None:
+        """Enqueue a retain with the full accumulated session so far."""
+        if not self._session_turns:
+            return
+
+        content = "\n".join(list(self._session_turns))
+        session_id_snapshot = self._session_id
+        database = self._group_id
+        num_turns = len(self._session_turns)
+
+        logger.info("Graphiti flushing %d turns (session=%s)", num_turns, session_id_snapshot)
+
+        def _do_retain():
+            from datetime import timezone as tz
+
+            now = datetime.now(tz.utc)
+            _run_sync(
+                self._graphiti.add_episode(
+                    name=f"turn-{now.strftime('%Y%m%d-%H%M%S')}",
+                    episode_body=content,
+                    source=EpisodeType.message,
+                    source_description="Hermes Agent conversation",
+                    reference_time=now,
+                    group_id=database,
+                )
+            )
+            logger.info(
+                "Graphiti retain succeeded (session=%s, turns=%d)",
+                session_id_snapshot, num_turns,
+            )
+
+        self._ensure_writer()
+        self._register_atexit()
+        self._retain_queue.put(_do_retain)
+
+    def _start_debounce_timer(self) -> None:
+        logger.debug("Graphiti debounce timer started (%ds)", self._retain_min_interval_seconds)
+        self._debounce_timer = threading.Timer(
+            self._retain_min_interval_seconds,
+            self._on_debounce_timeout,
+        )
+        self._debounce_timer.daemon = True
+        self._debounce_timer.start()
+
+    def _on_debounce_timeout(self) -> None:
+        """Timer callback — flush accumulated turns after silence."""
+        if self._shutting_down.is_set():
+            return
+        logger.debug(
+            "Graphiti debounce timeout (%ds), flushing %d turns",
+            self._retain_min_interval_seconds, len(self._session_turns),
+        )
+        self._flush_pending_turns()
+
     def sync_turn(
         self,
         user_content: str,
@@ -464,29 +535,22 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._turn_counter += 1
         self._turn_index = self._turn_counter
 
-        # Snapshot state for the background job
-        content = "[" + ",".join(list(self._session_turns)) + "]"
-        session_id_snapshot = self._session_id
-        database = self._group_id
+        # Two conditions trigger a flush:
+        #   1. Turn count reaches retain_every_n_turns → flush now.
+        #   2. No new messages for retain_min_interval_seconds → timer fires.
+        # Each new turn cancels the previous timer and starts a fresh one.
+        self._cancel_debounce_timer()
 
-        def _do_retain():
-            from datetime import timezone as tz
-
-            now = datetime.now(tz.utc)
-            _run_sync(
-                self._graphiti.add_episode(
-                    name=f"turn-{now.strftime('%Y%m%d-%H%M%S')}",
-                    episode_body=content,
-                    source_description="Hermes Agent conversation",
-                    reference_time=now,
-                    group_id=database,
-                )
-            )
-            logger.debug("Graphiti retain succeeded (session=%s)", session_id_snapshot)
-
-        self._ensure_writer()
-        self._register_atexit()
-        self._retain_queue.put(_do_retain)
+        if self._turn_counter % self._retain_every_n_turns == 0:
+            logger.debug("Graphiti turn threshold reached (%d/%d), flushing",
+                         self._turn_counter, self._retain_every_n_turns)
+            self._flush_pending_turns()
+        else:
+            logger.debug("Graphiti buffering turn %d/%d, timer %ds",
+                         self._turn_counter % self._retain_every_n_turns,
+                         self._retain_every_n_turns,
+                         self._retain_min_interval_seconds)
+            self._start_debounce_timer()
 
     # -- Tools ---------------------------------------------------------------
 
@@ -521,15 +585,15 @@ class GraphitiMemoryProvider(MemoryProvider):
     # -- Optional hooks ------------------------------------------------------
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Flush remaining turns at session end."""
-        if not self._session_turns:
-            return
+        """Cancel timer and flush remaining turns."""
         if self._shutting_down.is_set():
             return
+        self._cancel_debounce_timer()
+        if not self._session_turns:
+            return
 
-        snapshot_turns = list(self._session_turns)
+        content = "\n".join(list(self._session_turns))
         snapshot_session = self._session_id
-        content = "[" + ",".join(snapshot_turns) + "]"
         database = self._group_id
 
         def _flush():
@@ -538,6 +602,7 @@ class GraphitiMemoryProvider(MemoryProvider):
                 self._graphiti.add_episode(
                     name=f"session-end-{now.strftime('%Y%m%d-%H%M%S')}",
                     episode_body=content,
+                    source=EpisodeType.message,
                     source_description="Hermes Agent session end",
                     reference_time=now,
                     group_id=database,

@@ -48,6 +48,13 @@ def _load_config() -> dict:
         "embedding_model": os.environ.get("GRAPHITI_EMBEDDING_MODEL", ""),
         "memory_mode": os.environ.get("GRAPHITI_MEMORY_MODE", _DEFAULT_MEMORY_MODE),
         "auto_retain": os.environ.get("GRAPHITI_AUTO_RETAIN", "true").lower() != "false",
+        "retain_every_n_turns": int(os.environ.get("GRAPHITI_RETAIN_EVERY_N_TURNS", "10")),
+        "retain_min_interval_seconds": int(
+            os.environ.get("GRAPHITI_RETAIN_MIN_INTERVAL_SECONDS", "300")
+        ),
+        "extraction_language_instruction": os.environ.get(
+            "GRAPHITI_EXTRACTION_LANGUAGE_INSTRUCTION", ""
+        ),
         "recall_max_tokens": int(os.environ.get("GRAPHITI_RECALL_MAX_TOKENS", "4096")),
     }
 
@@ -122,6 +129,21 @@ def get_config_schema() -> list[dict[str, Any]]:
             "key": "auto_retain",
             "description": "Automatically retain conversation turns as episodes",
             "default": True,
+        },
+        {
+            "key": "retain_every_n_turns",
+            "description": "Flush pending turns after this many (10) — whichever comes first with the debounce timer below",
+            "default": 10,
+        },
+        {
+            "key": "retain_min_interval_seconds",
+            "description": "Flush pending turns after this many seconds of silence (default: 300 = 5 min)",
+            "default": 300,
+        },
+        {
+            "key": "extraction_language_instruction",
+            "description": "Custom extraction language instruction appended to entity extraction prompts. Leave blank to use graphiti-core default.",
+            "default": "",
         },
     ]
 
