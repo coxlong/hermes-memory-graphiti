@@ -126,6 +126,7 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._falkordb_username = ""
         self._falkordb_password = ""
         self._falkordb_database = _DEFAULT_DATABASE
+        self._group_id = _DEFAULT_DATABASE
         self._openai_api_key = ""
         self._llm_provider = "openai"
         self._llm_model = ""
@@ -207,6 +208,9 @@ class GraphitiMemoryProvider(MemoryProvider):
             os.environ.get("GRAPHITI_FALKORDB_PASSWORD", "")
         )
         self._falkordb_database = self._config.get("falkordb_database", _DEFAULT_DATABASE)
+        # Graphiti group_id must be alphanumeric + dashes/underscores only.
+        # FalkorDB allows colons in database names, so sanitize for group_id use.
+        self._group_id = self._falkordb_database.replace(":", "-")
         self._openai_api_key = (
             self._config.get("openai_api_key")
             or os.environ.get("GRAPHITI_OPENAI_API_KEY")
@@ -358,7 +362,7 @@ class GraphitiMemoryProvider(MemoryProvider):
                 edges = _run_sync(
                     self._graphiti.search(
                         query=query,
-                        group_ids=[self._falkordb_database],
+                        group_ids=[self._group_id],
                         num_results=10,
                     )
                 )
@@ -454,7 +458,7 @@ class GraphitiMemoryProvider(MemoryProvider):
         # Snapshot state for the background job
         content = "[" + ",".join(list(self._session_turns)) + "]"
         session_id_snapshot = self._session_id
-        database = self._falkordb_database
+        database = self._group_id
 
         def _do_retain():
             from datetime import timezone as tz
@@ -491,7 +495,7 @@ class GraphitiMemoryProvider(MemoryProvider):
                 edges = _run_sync(
                     self._graphiti.search(
                         query=query,
-                        group_ids=[self._falkordb_database],
+                        group_ids=[self._group_id],
                         num_results=self._recall_max_tokens // 400,
                     )
                 )
@@ -517,7 +521,7 @@ class GraphitiMemoryProvider(MemoryProvider):
         snapshot_turns = list(self._session_turns)
         snapshot_session = self._session_id
         content = "[" + ",".join(snapshot_turns) + "]"
-        database = self._falkordb_database
+        database = self._group_id
 
         def _flush():
             now = datetime.now(timezone.utc)
