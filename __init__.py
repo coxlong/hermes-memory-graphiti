@@ -334,10 +334,10 @@ class GraphitiMemoryProvider(MemoryProvider):
                 self._retain_queue.put(_WRITER_SENTINEL)
             except Exception:
                 pass
-            writer.join(timeout=10.0)
+            writer.join(timeout=30.0)
             if writer.is_alive():
                 logger.warning(
-                    "Graphiti writer did not stop within 10s; abandoning %d pending retain(s)",
+                    "Graphiti writer did not stop within 30s; abandoning %d pending retain(s)",
                     self._retain_queue.qsize(),
                 )
 
