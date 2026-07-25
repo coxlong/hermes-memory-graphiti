@@ -135,6 +135,7 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._auto_retain = True
         self._retain_every_n_turns = 10
         self._retain_min_interval_seconds = 300
+        self._shutdown_timeout = 60
         self._extraction_language_instruction = ""
         self._recall_max_tokens = _DEFAULT_RECALL_MAX_TOKENS
 
@@ -243,6 +244,9 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._retain_min_interval_seconds = int(
             self._config.get("retain_min_interval_seconds", 300)
         )
+        self._shutdown_timeout = int(
+            self._config.get("shutdown_timeout", 60)
+        )
         self._extraction_language_instruction = str(
             self._config.get("extraction_language_instruction", "")
         ).strip()
@@ -334,10 +338,12 @@ class GraphitiMemoryProvider(MemoryProvider):
                 self._retain_queue.put(_WRITER_SENTINEL)
             except Exception:
                 pass
-            writer.join(timeout=30.0)
+            timeout = self._shutdown_timeout
+            writer.join(timeout=float(timeout))
             if writer.is_alive():
                 logger.warning(
-                    "Graphiti writer did not stop within 30s; abandoning %d pending retain(s)",
+                    "Graphiti writer did not stop within %ds; abandoning %d pending retain(s)",
+                    timeout,
                     self._retain_queue.qsize(),
                 )
 

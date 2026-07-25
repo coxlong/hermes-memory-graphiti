@@ -52,6 +52,9 @@ def _load_config() -> dict:
         "retain_min_interval_seconds": int(
             os.environ.get("GRAPHITI_RETAIN_MIN_INTERVAL_SECONDS", "300")
         ),
+        "shutdown_timeout": int(
+            os.environ.get("GRAPHITI_SHUTDOWN_TIMEOUT", "60")
+        ),
         "extraction_language_instruction": os.environ.get(
             "GRAPHITI_EXTRACTION_LANGUAGE_INSTRUCTION", ""
         ),
@@ -139,6 +142,11 @@ def get_config_schema() -> list[dict[str, Any]]:
             "key": "retain_min_interval_seconds",
             "description": "Flush pending turns after this many seconds of silence (default: 300 = 5 min)",
             "default": 300,
+        },
+        {
+            "key": "shutdown_timeout",
+            "description": "Max seconds to wait for in-flight retains during shutdown (default: 60)",
+            "default": 60,
         },
         {
             "key": "extraction_language_instruction",
