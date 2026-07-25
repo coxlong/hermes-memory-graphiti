@@ -1,0 +1,551 @@
+"""Graphiti memory plugin — MemoryProvider interface.
+
+Temporal knowledge graph memory with FalkorDB. Records entities and
+relationships with timeline awareness — tracking *when* each fact was
+established, when it changed, and what the source was.
+
+Config via environment variables:
+  GRAPHITI_FALKORDB_HOST          — FalkorDB host (default: localhost)
+  GRAPHITI_FALKORDB_PORT          — FalkorDB port (default: 6379)
+  GRAPHITI_FALKORDB_PASSWORD      — FalkorDB password
+  GRAPHITI_FALKORDB_DATABASE      — FalkorDB database name (default: default_db)
+  GRAPHITI_OPENAI_API_KEY         — OpenAI API key for entity/edge extraction
+  GRAPHITI_LLM_PROVIDER           — LLM provider (default: openai)
+  GRAPHITI_LLM_MODEL              — LLM model (blank = provider default)
+  GRAPHITI_LLM_BASE_URL           — Custom LLM endpoint URL
+  GRAPHITI_MEMORY_MODE            — context, tools, or hybrid (default: hybrid)
+  GRAPHITI_AUTO_RECALL            — auto-recall before each turn (default: true)
+  GRAPHITI_AUTO_RETAIN            — auto-retain turns as episodes (default: true)
+
+Or via $HERMES_HOME/graphiti/config.json (profile-scoped).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+import json
+import logging
+import os
+import queue
+import threading
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from agent.memory_provider import MemoryProvider
+from tools.registry import tool_error
+
+from .config import _DEFAULT_HOST, _DEFAULT_PORT, _DEFAULT_DATABASE, _DEFAULT_MEMORY_MODE
+from .config import _load_config, get_config_schema, save_config
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_INPUT_CHARS = 800
+_DEFAULT_RECALL_MAX_TOKENS = 4096
+
+# ---------------------------------------------------------------------------
+# Tool schemas
+# ---------------------------------------------------------------------------
+
+SEARCH_SCHEMA = {
+    "name": "graphiti_search",
+    "description": (
+        "Search the temporal knowledge graph for facts, entities, and relationships. "
+        "Returns results ranked by relevance using hybrid search (semantic + keyword). "
+        "Use this to recall information about the user, past decisions, projects, "
+        "and any facts recorded in previous conversations."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to search for in natural language."},
+        },
+        "required": ["query"],
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Sentinel for clean writer shutdown
+# ---------------------------------------------------------------------------
+
+_WRITER_SENTINEL = object()
+
+# ---------------------------------------------------------------------------
+# Dedicated event loop for Graphiti async calls
+# ---------------------------------------------------------------------------
+
+_loop: asyncio.AbstractEventLoop | None = None
+_loop_thread: threading.Thread | None = None
+_loop_lock = threading.Lock()
+
+
+def _get_loop() -> asyncio.AbstractEventLoop:
+    """Return a long-lived event loop running on a background daemon thread."""
+    global _loop, _loop_thread
+    with _loop_lock:
+        if _loop is not None and _loop.is_running():
+            return _loop
+        _loop = asyncio.new_event_loop()
+
+        def _run():
+            asyncio.set_event_loop(_loop)
+            _loop.run_forever()
+
+        _loop_thread = threading.Thread(target=_run, daemon=True, name="graphiti-loop")
+        _loop_thread.start()
+        return _loop
+
+
+def _run_sync(coro, timeout: float = 120.0):
+    """Schedule *coro* on the shared loop and block until done."""
+    from agent.async_utils import safe_schedule_threadsafe
+
+    loop = _get_loop()
+    future = safe_schedule_threadsafe(coro, loop)
+    if future is None:
+        raise RuntimeError("Graphiti loop unavailable")
+    return future.result(timeout=timeout)
+
+
+def _utc_timestamp() -> str:
+    """Return current UTC timestamp in ISO-8601 with milliseconds and Z suffix."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+# ---------------------------------------------------------------------------
+# GraphitiMemoryProvider
+# ---------------------------------------------------------------------------
+
+
+class GraphitiMemoryProvider(MemoryProvider):
+    """Temporal knowledge graph memory via Graphiti + FalkorDB."""
+
+    def __init__(self):
+        self._config: dict[str, Any] = {}
+        self._falkordb_host = _DEFAULT_HOST
+        self._falkordb_port = _DEFAULT_PORT
+        self._falkordb_username = ""
+        self._falkordb_password = ""
+        self._falkordb_database = _DEFAULT_DATABASE
+        self._openai_api_key = ""
+        self._llm_provider = "openai"
+        self._llm_model = ""
+        self._llm_base_url = ""
+        self._memory_mode = _DEFAULT_MEMORY_MODE
+        self._auto_recall = True
+        self._auto_retain = True
+        self._recall_max_tokens = _DEFAULT_RECALL_MAX_TOKENS
+
+        self._graphiti = None
+        self._session_id = ""
+        self._platform = ""
+        self._turn_index = 0
+        self._turn_counter = 0
+        self._session_turns: list[str] = []
+
+        # Prefetch state
+        self._prefetch_result = ""
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_thread: threading.Thread | None = None
+
+        # Writer state (single-writer model, same as Hindsight)
+        self._retain_queue: queue.Queue = queue.Queue()
+        self._writer_thread: threading.Thread | None = None
+        self._shutting_down = threading.Event()
+        self._atexit_registered = False
+
+    # -- Provider identity ---------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return "graphiti"
+
+    def is_available(self) -> bool:
+        """Check config and connectivity. No network calls — just config/env checks."""
+        try:
+            cfg = _load_config()
+            has_host = bool(cfg.get("falkordb_host"))
+            has_key = bool(
+                cfg.get("openai_api_key")
+                or os.environ.get("GRAPHITI_OPENAI_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+            )
+            return has_host and has_key
+        except Exception:
+            return False
+
+    # -- Config --------------------------------------------------------------
+
+    def get_config_schema(self) -> List[Dict[str, Any]]:
+        return get_config_schema()
+
+    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+        save_config(values, hermes_home)
+
+    # -- Core lifecycle ------------------------------------------------------
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        from graphiti_core import Graphiti
+        from graphiti_core.driver.falkordb_driver import FalkorDriver
+        from graphiti_core.llm_client.config import LLMConfig
+        from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+        from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+
+        self._session_id = str(session_id or "").strip()
+        self._platform = str(kwargs.get("platform") or "").strip()
+        self._turn_index = 0
+        self._turn_counter = 0
+        self._session_turns = []
+
+        # Load config
+        self._config = _load_config()
+        self._falkordb_host = self._config.get("falkordb_host", _DEFAULT_HOST)
+        self._falkordb_port = int(self._config.get("falkordb_port", _DEFAULT_PORT))
+        self._falkordb_username = (
+            self._config.get("falkordb_username")
+            or os.environ.get("GRAPHITI_FALKORDB_USERNAME", "")
+        )
+        self._falkordb_password = (
+            os.environ.get("GRAPHITI_FALKORDB_PASSWORD", "")
+        )
+        self._falkordb_database = self._config.get("falkordb_database", _DEFAULT_DATABASE)
+        self._openai_api_key = (
+            self._config.get("openai_api_key")
+            or os.environ.get("GRAPHITI_OPENAI_API_KEY")
+            or os.environ.get("OPENAI_API_KEY", "")
+        )
+        self._llm_provider = self._config.get("llm_provider", "openai")
+        self._llm_model = self._config.get("llm_model", "")
+        self._llm_base_url = self._config.get("llm_base_url", "")
+
+        self._memory_mode = self._config.get("memory_mode", _DEFAULT_MEMORY_MODE)
+        if self._memory_mode not in {"context", "tools", "hybrid"}:
+            self._memory_mode = _DEFAULT_MEMORY_MODE
+
+        self._auto_recall = self._config.get("auto_recall", True)
+        self._auto_retain = self._config.get("auto_retain", True)
+        self._recall_max_tokens = int(self._config.get("recall_max_tokens", _DEFAULT_RECALL_MAX_TOKENS))
+
+        # Set OpenAI api key in env for graphiti-core to pick up
+        if self._openai_api_key:
+            os.environ.setdefault("OPENAI_API_KEY", self._openai_api_key)
+
+        # Build driver
+        driver = FalkorDriver(
+            host=self._falkordb_host,
+            port=self._falkordb_port,
+            username=self._falkordb_username or None,
+            password=self._falkordb_password or None,
+            database=self._falkordb_database,
+        )
+
+        # Build LLM client — use OpenAIGenericClient for OpenAI-compatible APIs
+        # (DeepSeek, vLLM, Ollama, etc.) with json_object structured output fallback.
+        # The dedicated OpenAIClient uses responses.parse() which many providers
+        # don't support; OpenAIGenericClient targets any /chat/completions endpoint.
+        llm_config = LLMConfig(
+            api_key=self._openai_api_key or None,
+            base_url=self._llm_base_url or None,
+            model=self._llm_model or None,
+        )
+        llm_client = OpenAIGenericClient(
+            config=llm_config,
+            structured_output_mode="json_object",
+        )
+
+        # Build embedder
+        embedder_config = OpenAIEmbedderConfig(
+            api_key=self._openai_api_key or None,
+            base_url=self._llm_base_url or None,
+            embedding_model=self._config.get("embedding_model") or None,
+        )
+        embedder = OpenAIEmbedder(config=embedder_config)
+
+        self._graphiti = Graphiti(
+            graph_driver=driver,
+            llm_client=llm_client,
+            embedder=embedder,
+        )
+
+        logger.info(
+            "Graphiti initialized: host=%s:%d db=%s provider=%s mode=%s auto_recall=%s auto_retain=%s",
+            self._falkordb_host, self._falkordb_port, self._falkordb_database,
+            self._llm_provider, self._memory_mode, self._auto_recall, self._auto_retain,
+        )
+
+        # Build indices on init (idempotent — skips if already exist)
+        try:
+            _run_sync(self._graphiti.build_indices_and_constraints())
+        except Exception as exc:
+            logger.warning("Graphiti build_indices_and_constraints failed: %s", exc)
+
+    def system_prompt_block(self) -> str:
+        if self._memory_mode == "context":
+            return (
+                "# Graphiti Memory\n"
+                "Active (context mode). Temporal knowledge graph via FalkorDB.\n"
+                "Relevant memories are automatically injected into context."
+            )
+        if self._memory_mode == "tools":
+            return (
+                "# Graphiti Memory\n"
+                "Active (tools mode). Temporal knowledge graph via FalkorDB.\n"
+                "Use graphiti_search to recall facts and relationships "
+                "from previous conversations."
+            )
+        return (
+            "# Graphiti Memory\n"
+            "Active. Temporal knowledge graph via FalkorDB.\n"
+            "Relevant memories are automatically injected into context. "
+            "Use graphiti_search to search for additional facts and relationships."
+        )
+
+    def shutdown(self) -> None:
+        logger.debug("Graphiti shutdown: stopping writer + closing connection")
+        self._shutting_down.set()
+
+        # Drain the writer
+        writer = self._writer_thread
+        if writer is not None and writer.is_alive():
+            try:
+                self._retain_queue.put(_WRITER_SENTINEL)
+            except Exception:
+                pass
+            writer.join(timeout=10.0)
+            if writer.is_alive():
+                logger.warning(
+                    "Graphiti writer did not stop within 10s; abandoning %d pending retain(s)",
+                    self._retain_queue.qsize(),
+                )
+
+        # Wait for in-flight prefetch
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=5.0)
+
+        # Close Graphiti connection
+        if self._graphiti is not None:
+            try:
+                _run_sync(self._graphiti.close())
+            except Exception:
+                pass
+            self._graphiti = None
+
+    # -- Prefetch / recall ---------------------------------------------------
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # Wait for background prefetch to complete
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=3.0)
+        with self._prefetch_lock:
+            result = self._prefetch_result
+            self._prefetch_result = ""
+        if not result:
+            return ""
+        header = (
+            "# Graphiti Memory (persistent temporal knowledge)\n"
+            "Use this to answer questions about the user and prior sessions. "
+            "Do not call tools to look up information that is already present here."
+        )
+        return f"{header}\n\n{result}"
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        if self._memory_mode == "tools":
+            return
+        if not self._auto_recall:
+            return
+        if self._shutting_down.is_set():
+            return
+        if len(query) > _DEFAULT_MAX_INPUT_CHARS:
+            query = query[:_DEFAULT_MAX_INPUT_CHARS]
+
+        def _run():
+            try:
+                edges = _run_sync(
+                    self._graphiti.search(
+                        query=query,
+                        group_ids=[self._falkordb_database],
+                        num_results=10,
+                    )
+                )
+                if edges:
+                    lines = [f"- {e.fact}" for e in edges if e.fact]
+                    if lines:
+                        with self._prefetch_lock:
+                            self._prefetch_result = "\n".join(lines)
+                logger.debug("Graphiti prefetch: %d results", len(edges) if edges else 0)
+            except Exception as exc:
+                logger.debug("Graphiti prefetch failed: %s", exc, exc_info=True)
+
+        self._prefetch_thread = threading.Thread(
+            target=_run, daemon=True, name="graphiti-prefetch"
+        )
+        self._prefetch_thread.start()
+
+    # -- Sync turn (retain) -------------------------------------------------
+
+    def _build_turn_content(self, user_content: str, assistant_content: str) -> str:
+        return json.dumps(
+            [
+                {"role": "user", "content": user_content, "timestamp": _utc_timestamp()},
+                {"role": "assistant", "content": assistant_content, "timestamp": _utc_timestamp()},
+            ],
+            ensure_ascii=False,
+        )
+
+    def _ensure_writer(self) -> None:
+        thread = self._writer_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._shutting_down.clear()
+        thread = threading.Thread(
+            target=self._writer_loop, daemon=True, name="graphiti-writer"
+        )
+        self._writer_thread = thread
+        thread.start()
+
+    def _writer_loop(self) -> None:
+        while True:
+            try:
+                job = self._retain_queue.get(timeout=1.0)
+            except queue.Empty:
+                if self._shutting_down.is_set():
+                    return
+                continue
+            try:
+                if job is _WRITER_SENTINEL:
+                    return
+                try:
+                    job()
+                except Exception as exc:
+                    logger.warning("Graphiti retain failed: %s", exc, exc_info=True)
+            finally:
+                self._retain_queue.task_done()
+
+    def _register_atexit(self) -> None:
+        if self._atexit_registered:
+            return
+        self._atexit_registered = True
+        atexit.register(self._atexit_shutdown)
+
+    def _atexit_shutdown(self) -> None:
+        if self._shutting_down.is_set():
+            return
+        try:
+            self.shutdown()
+        except Exception as exc:
+            logger.debug("Graphiti atexit shutdown failed: %s", exc)
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        if not self._auto_retain:
+            return
+        if self._shutting_down.is_set():
+            return
+
+        if session_id:
+            self._session_id = str(session_id).strip()
+
+        turn = self._build_turn_content(user_content, assistant_content)
+        self._session_turns.append(turn)
+        self._turn_counter += 1
+        self._turn_index = self._turn_counter
+
+        # Snapshot state for the background job
+        content = "[" + ",".join(list(self._session_turns)) + "]"
+        session_id_snapshot = self._session_id
+        database = self._falkordb_database
+
+        def _do_retain():
+            from datetime import timezone as tz
+
+            now = datetime.now(tz.utc)
+            _run_sync(
+                self._graphiti.add_episode(
+                    name=f"turn-{now.strftime('%Y%m%d-%H%M%S')}",
+                    episode_body=content,
+                    source_description="Hermes Agent conversation",
+                    reference_time=now,
+                    group_id=database,
+                )
+            )
+            logger.debug("Graphiti retain succeeded (session=%s)", session_id_snapshot)
+
+        self._ensure_writer()
+        self._register_atexit()
+        self._retain_queue.put(_do_retain)
+
+    # -- Tools ---------------------------------------------------------------
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        if self._memory_mode == "context":
+            return []
+        return [SEARCH_SCHEMA]
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        if tool_name == "graphiti_search":
+            query = args.get("query", "")
+            if not query:
+                return tool_error("Missing required parameter: query")
+            try:
+                edges = _run_sync(
+                    self._graphiti.search(
+                        query=query,
+                        group_ids=[self._falkordb_database],
+                        num_results=self._recall_max_tokens // 400,
+                    )
+                )
+                if not edges:
+                    return json.dumps({"result": "No relevant memories found."})
+                lines = [f"{i}. {e.fact}" for i, e in enumerate(edges, 1) if e.fact]
+                return json.dumps({"result": "\n".join(lines)}, ensure_ascii=False)
+            except Exception as exc:
+                logger.warning("graphiti_search failed: %s", exc, exc_info=True)
+                return tool_error(f"Failed to search memory: {exc}")
+
+        return tool_error(f"Unknown tool: {tool_name}")
+
+    # -- Optional hooks ------------------------------------------------------
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Flush remaining turns at session end."""
+        if not self._session_turns:
+            return
+        if self._shutting_down.is_set():
+            return
+
+        snapshot_turns = list(self._session_turns)
+        snapshot_session = self._session_id
+        content = "[" + ",".join(snapshot_turns) + "]"
+        database = self._falkordb_database
+
+        def _flush():
+            now = datetime.now(timezone.utc)
+            _run_sync(
+                self._graphiti.add_episode(
+                    name=f"session-end-{now.strftime('%Y%m%d-%H%M%S')}",
+                    episode_body=content,
+                    source_description="Hermes Agent session end",
+                    reference_time=now,
+                    group_id=database,
+                )
+            )
+            logger.debug("Graphiti session-end flush succeeded (session=%s)", snapshot_session)
+
+        self._ensure_writer()
+        self._retain_queue.put(_flush)
+
+
+# ---------------------------------------------------------------------------
+# Plugin entry point
+# ---------------------------------------------------------------------------
+
+
+def register(ctx) -> None:
+    """Register Graphiti as a memory provider plugin."""
+    ctx.register_memory_provider(GraphitiMemoryProvider())

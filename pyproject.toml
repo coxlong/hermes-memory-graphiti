@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-memory-graphiti"
+version = "0.1.0"
+description = "Graphiti memory provider plugin for Hermes Agent — temporal knowledge graph memory via FalkorDB."
+authors = [{ name = "coxlong" }]
+requires-python = ">=3.10"
+dependencies = [
+    "graphiti-core>=0.25.0",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+graphiti = "hermes_graphiti"
