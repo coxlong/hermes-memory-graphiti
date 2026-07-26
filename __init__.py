@@ -112,6 +112,35 @@ def _utc_timestamp() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Chunked embedder — wraps any EmbedderClient to enforce batch-size limits.
+# Some embedding APIs (e.g. qwen3.7-text-embedding) reject batches > 20.
+# ---------------------------------------------------------------------------
+
+
+class _ChunkedEmbedder:
+    """Proxy that splits oversized create_batch calls into API-safe chunks."""
+
+    def __init__(self, delegate, *, chunk_size: int = 20):
+        self._delegate = delegate
+        self._chunk_size = chunk_size
+
+    async def create(self, input_data):
+        return await self._delegate.create(input_data)
+
+    async def create_batch(self, input_data_list):
+        total = len(input_data_list)
+        if total <= self._chunk_size:
+            return await self._delegate.create_batch(input_data_list)
+        logger.debug("Embedding chunk: %d items → %d batches of ≤%d",
+                     total, (total + self._chunk_size - 1) // self._chunk_size, self._chunk_size)
+        results = []
+        for i in range(0, total, self._chunk_size):
+            chunk = input_data_list[i:i + self._chunk_size]
+            results.extend(await self._delegate.create_batch(chunk))
+        return results
+
+
+# ---------------------------------------------------------------------------
 # GraphitiMemoryProvider
 # ---------------------------------------------------------------------------
 
@@ -135,7 +164,7 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._auto_retain = True
         self._retain_every_n_turns = 10
         self._retain_min_interval_seconds = 300
-        self._shutdown_timeout = 60
+        self._shutdown_timeout = 10
         self._extraction_language_instruction = ""
         self._recall_max_tokens = _DEFAULT_RECALL_MAX_TOKENS
 
@@ -266,7 +295,8 @@ class GraphitiMemoryProvider(MemoryProvider):
                      self._memory_mode, self._retain_every_n_turns,
                      self._retain_min_interval_seconds, self._shutdown_timeout)
         if self._extraction_language_instruction:
-            logger.info("Graphiti extraction language instruction: custom (overridden)")
+            logger.info("Graphiti extraction language instruction: %r",
+                        self._extraction_language_instruction)
 
         # Build driver
         logger.info("Graphiti connecting to FalkorDB...")
@@ -294,13 +324,18 @@ class GraphitiMemoryProvider(MemoryProvider):
         )
         logger.info("Graphiti LLM client created (OpenAIGenericClient, json_object mode)")
 
-        # Build embedder
+        # Build embedder — wrap in a chunked variant because the embedding API
+        # (qwen3.7-text-embedding via napi.geekkit.net) limits batch size to 20,
+        # while graphiti-core's create_entity_node_embeddings / create_entity_edge_embeddings
+        # send ALL nodes/edges in a single create_batch call without chunking.
         embedder_config = OpenAIEmbedderConfig(
             api_key=self._openai_api_key or None,
             base_url=self._llm_base_url or None,
             embedding_model=self._config.get("embedding_model") or None,
         )
-        embedder = OpenAIEmbedder(config=embedder_config)
+        base_embedder = OpenAIEmbedder(config=embedder_config)
+        embedder = _ChunkedEmbedder(base_embedder, chunk_size=20)
+        logger.info("Graphiti embedder created (OpenAIEmbedder, chunked at 20)")
 
         self._graphiti = Graphiti(
             graph_driver=driver,
@@ -341,7 +376,34 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._cancel_debounce_timer()
         self._shutting_down.set()
 
-        # Drain the writer
+        # Safety net: if on_session_end was not called before shutdown (edge
+        # case — test teardown, force kill, etc.), extract remaining turns
+        # synchronously so no data is lost.
+        if self._session_turns:
+            content = "\n".join(list(self._session_turns))
+            self._session_turns = []
+            num_turns = content.count("\n") + 1
+            logger.info("Graphiti shutdown extracting %d remaining turns", num_turns)
+            try:
+                from graphiti_core.nodes import EpisodeType
+                now = datetime.now(timezone.utc)
+                _run_sync(
+                    self._graphiti.add_episode(
+                        name=f"shutdown-{now.strftime('%Y%m%d-%H%M%S')}",
+                        episode_body=content,
+                        source=EpisodeType.message,
+                        source_description="Hermes Agent shutdown",
+                        reference_time=now,
+                        group_id=self._group_id,
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Graphiti shutdown extraction failed: %s", exc)
+
+        # Drain the writer. After on_session_end did the heavy extraction
+        # synchronously, the queue is empty or near-empty — join should
+        # return in milliseconds unless a _flush_pending_turns retain is
+        # still in-flight from before the session-end boundary.
         writer = self._writer_thread
         if writer is not None and writer.is_alive():
             try:
@@ -510,6 +572,10 @@ class GraphitiMemoryProvider(MemoryProvider):
         self._register_atexit()
         self._retain_queue.put(_do_retain)
 
+        # Clear the buffer so these turns are not extracted again on the
+        # next _flush_pending_turns or on_session_end call.
+        self._session_turns = []
+
     def _start_debounce_timer(self) -> None:
         logger.debug("Graphiti debounce timer started (%ds)", self._retain_min_interval_seconds)
         self._debounce_timer = threading.Timer(
@@ -600,10 +666,14 @@ class GraphitiMemoryProvider(MemoryProvider):
     # -- Optional hooks ------------------------------------------------------
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Cancel timer and enqueue remaining turns — non-blocking.
+        """Cancel timer and extract remaining turns synchronously.
 
-        Uses the same writer queue as sync_turn so shutdown can drain it.
-        Must NOT block on the LLM call — /reset waits for this hook to return.
+        Runs the LLM extraction directly on the calling thread — this hook is
+        always invoked from a background worker (MemoryManager's daemon executor
+        or gateway's off-loop worker), so blocking here is safe.  Doing the work
+        inline means the writer queue is empty when shutdown() drains it, so
+        writer.join() returns in milliseconds instead of waiting for an LLM
+        round-trip.
         """
         if self._shutting_down.is_set():
             return
@@ -612,29 +682,30 @@ class GraphitiMemoryProvider(MemoryProvider):
             return
 
         content = "\n".join(list(self._session_turns))
-        logger.info("Graphiti session-end enqueuing %d turns", len(self._session_turns))
+        self._session_turns = []
 
-        def _flush():
-            from graphiti_core.nodes import EpisodeType
+        num_turns = content.count("\n") + 1
+        logger.info("Graphiti session-end extracting %d turns (session=%s)",
+                    num_turns, self._session_id)
 
-            now = datetime.now(timezone.utc)
-            try:
-                _run_sync(
-                    self._graphiti.add_episode(
-                        name=f"session-end-{now.strftime('%Y%m%d-%H%M%S')}",
-                        episode_body=content,
-                        source=EpisodeType.message,
-                        source_description="Hermes Agent session end",
-                        reference_time=now,
-                        group_id=self._group_id,
-                    ),
-                )
-                logger.info("Graphiti session-end flush succeeded (session=%s)", self._session_id)
-            except Exception as exc:
-                logger.warning("Graphiti session-end flush failed: %s", exc)
+        from graphiti_core.nodes import EpisodeType
 
-        self._ensure_writer()
-        self._retain_queue.put(_flush)
+        now = datetime.now(timezone.utc)
+        try:
+            _run_sync(
+                self._graphiti.add_episode(
+                    name=f"session-end-{now.strftime('%Y%m%d-%H%M%S')}",
+                    episode_body=content,
+                    source=EpisodeType.message,
+                    source_description="Hermes Agent session end",
+                    reference_time=now,
+                    group_id=self._group_id,
+                ),
+            )
+            logger.info("Graphiti session-end extraction succeeded (session=%s, turns=%d)",
+                        self._session_id, num_turns)
+        except Exception as exc:
+            logger.warning("Graphiti session-end extraction failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

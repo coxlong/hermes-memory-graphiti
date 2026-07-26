@@ -53,7 +53,7 @@ def _load_config() -> dict:
             os.environ.get("GRAPHITI_RETAIN_MIN_INTERVAL_SECONDS", "300")
         ),
         "shutdown_timeout": int(
-            os.environ.get("GRAPHITI_SHUTDOWN_TIMEOUT", "60")
+            os.environ.get("GRAPHITI_SHUTDOWN_TIMEOUT", "10")
         ),
         "extraction_language_instruction": os.environ.get(
             "GRAPHITI_EXTRACTION_LANGUAGE_INSTRUCTION", ""
@@ -145,8 +145,8 @@ def get_config_schema() -> list[dict[str, Any]]:
         },
         {
             "key": "shutdown_timeout",
-            "description": "Max seconds to wait for in-flight retains during shutdown (default: 60)",
-            "default": 60,
+            "description": "Max seconds to wait for in-flight retains during shutdown (default: 10)",
+            "default": 10,
         },
         {
             "key": "extraction_language_instruction",
