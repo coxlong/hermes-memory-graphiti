@@ -112,35 +112,6 @@ def _utc_timestamp() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Chunked embedder — wraps any EmbedderClient to enforce batch-size limits.
-# Some embedding APIs (e.g. qwen3.7-text-embedding) reject batches > 20.
-# ---------------------------------------------------------------------------
-
-
-class _ChunkedEmbedder:
-    """Proxy that splits oversized create_batch calls into API-safe chunks."""
-
-    def __init__(self, delegate, *, chunk_size: int = 20):
-        self._delegate = delegate
-        self._chunk_size = chunk_size
-
-    async def create(self, input_data):
-        return await self._delegate.create(input_data)
-
-    async def create_batch(self, input_data_list):
-        total = len(input_data_list)
-        if total <= self._chunk_size:
-            return await self._delegate.create_batch(input_data_list)
-        logger.debug("Embedding chunk: %d items → %d batches of ≤%d",
-                     total, (total + self._chunk_size - 1) // self._chunk_size, self._chunk_size)
-        results = []
-        for i in range(0, total, self._chunk_size):
-            chunk = input_data_list[i:i + self._chunk_size]
-            results.extend(await self._delegate.create_batch(chunk))
-        return results
-
-
-# ---------------------------------------------------------------------------
 # GraphitiMemoryProvider
 # ---------------------------------------------------------------------------
 
@@ -328,6 +299,31 @@ class GraphitiMemoryProvider(MemoryProvider):
         # (qwen3.7-text-embedding via napi.geekkit.net) limits batch size to 20,
         # while graphiti-core's create_entity_node_embeddings / create_entity_edge_embeddings
         # send ALL nodes/edges in a single create_batch call without chunking.
+        from graphiti_core.embedder.client import EmbedderClient as _EmbedderClient
+
+        class _ChunkedEmbedder(_EmbedderClient):
+            """Proxy that splits oversized create_batch calls into API-safe chunks."""
+
+            def __init__(self, delegate, *, chunk_size: int = 20):
+                self._delegate = delegate
+                self._chunk_size = chunk_size
+
+            async def create(self, input_data):
+                return await self._delegate.create(input_data)
+
+            async def create_batch(self, input_data_list):
+                total = len(input_data_list)
+                if total <= self._chunk_size:
+                    return await self._delegate.create_batch(input_data_list)
+                logger.debug("Embedding chunk: %d items → %d batches of ≤%d",
+                             total, (total + self._chunk_size - 1) // self._chunk_size,
+                             self._chunk_size)
+                results = []
+                for i in range(0, total, self._chunk_size):
+                    chunk = input_data_list[i:i + self._chunk_size]
+                    results.extend(await self._delegate.create_batch(chunk))
+                return results
+
         embedder_config = OpenAIEmbedderConfig(
             api_key=self._openai_api_key or None,
             base_url=self._llm_base_url or None,
