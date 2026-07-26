@@ -6,4 +6,10 @@ pip_dependencies:
   - "falkordb"
 requires_env: []
 hooks:
+  - prefetch
+  - queue_prefetch
+  - sync_turn
+  - system_prompt_block
+  - on_pre_compress
   - on_session_end
+  - shutdown

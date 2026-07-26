@@ -49,15 +49,33 @@ _DEFAULT_RECALL_MAX_TOKENS = 4096
 SEARCH_SCHEMA = {
     "name": "graphiti_search",
     "description": (
-        "Search the temporal knowledge graph for facts, entities, and relationships. "
-        "Returns results ranked by relevance using hybrid search (semantic + keyword). "
-        "Use this to recall information about the user, past decisions, projects, "
-        "and any facts recorded in previous conversations."
+        "Search the temporal knowledge graph for facts, entities, and relationships.\n"
+        "Available search methods:\n"
+        "- bm25: exact keyword matching. Matches documents containing the query terms. "
+        "Precise for specific names, terms, or codes, but may miss information "
+        "expressed in different words (synonyms, paraphrases).\n"
+        "- semantic: meaning-based matching via embeddings. Matches documents that "
+        "are semantically similar even when words differ. Good at finding "
+        "conceptually related information, but may be less precise for rare or "
+        "highly specific terms.\n"
+        "- hybrid: (default) combines bm25 and semantic. Most robust for general use."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "What to search for in natural language."},
+            "query": {
+                "type": "string",
+                "description": "What to search for. Use keywords for bm25, natural language for semantic/hybrid.",
+            },
+            "search_method": {
+                "type": "string",
+                "enum": ["bm25", "semantic", "hybrid"],
+                "description": "Default: hybrid.",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Max results to return (default: 20).",
+            },
         },
         "required": ["query"],
     },
@@ -641,17 +659,58 @@ class GraphitiMemoryProvider(MemoryProvider):
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
+
+            search_method = args.get("search_method", "hybrid")
+            if search_method not in ("bm25", "semantic", "hybrid"):
+                return tool_error(f"Invalid search_method: {search_method}. Must be one of: bm25, semantic, hybrid")
+
+            max_results = int(args.get("max_results", 20))
+            if max_results < 1:
+                max_results = 1
+            elif max_results > 50:
+                max_results = 50
+
             try:
-                edges = _run_sync(
-                    self._graphiti.search(
-                        query=query,
-                        group_ids=[self._group_id],
-                        num_results=self._recall_max_tokens // 400,
-                    )
+                from graphiti_core.search.search_config import (
+                    EdgeSearchConfig,
+                    EdgeSearchMethod,
+                    SearchConfig,
                 )
+
+                if search_method == "bm25":
+                    config = SearchConfig(
+                        edge_config=EdgeSearchConfig(
+                            search_methods=[EdgeSearchMethod.bm25],
+                        ),
+                    )
+                elif search_method == "semantic":
+                    config = SearchConfig(
+                        edge_config=EdgeSearchConfig(
+                            search_methods=[EdgeSearchMethod.cosine_similarity],
+                        ),
+                    )
+                else:  # hybrid
+                    config = SearchConfig(
+                        edge_config=EdgeSearchConfig(
+                            search_methods=[EdgeSearchMethod.bm25, EdgeSearchMethod.cosine_similarity],
+                        ),
+                    )
+
+                edges = _run_sync(
+                    self._graphiti.search_(
+                        query=query,
+                        config=config,
+                        group_ids=[self._group_id],
+                    ),
+                )
+
+                # self._graphiti.search_() returns SearchResults, extract the edges
+                if hasattr(edges, 'edges'):
+                    edges = edges.edges
+
                 if not edges:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {e.fact}" for i, e in enumerate(edges, 1) if e.fact]
+                lines = [f"{i}. {e.fact}" for i, e in enumerate(edges[:max_results], 1) if e.fact]
                 return json.dumps({"result": "\n".join(lines)}, ensure_ascii=False)
             except Exception as exc:
                 logger.warning("graphiti_search failed: %s", exc, exc_info=True)
@@ -660,6 +719,44 @@ class GraphitiMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     # -- Optional hooks ------------------------------------------------------
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> None:
+        """Flush pending turns before the context engine compresses older messages.
+
+        Compression can drop conversation history — extract episodes from any
+        buffered turns before they're lost.
+        """
+        if self._shutting_down.is_set():
+            return
+        self._cancel_debounce_timer()
+        if not self._session_turns:
+            return
+
+        content = "\n".join(list(self._session_turns))
+        self._session_turns = []
+
+        num_turns = content.count("\n") + 1
+        logger.info("Graphiti pre-compress extracting %d turns (session=%s)",
+                    num_turns, self._session_id)
+
+        from graphiti_core.nodes import EpisodeType
+
+        now = datetime.now(timezone.utc)
+        try:
+            _run_sync(
+                self._graphiti.add_episode(
+                    name=f"compress-{now.strftime('%Y%m%d-%H%M%S')}",
+                    episode_body=content,
+                    source=EpisodeType.message,
+                    source_description="Pre-compress flush",
+                    reference_time=now,
+                    group_id=self._group_id,
+                ),
+            )
+            logger.info("Graphiti pre-compress extraction succeeded (session=%s, turns=%d)",
+                        self._session_id, num_turns)
+        except Exception as exc:
+            logger.warning("Graphiti pre-compress extraction failed: %s", exc)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Cancel timer and extract remaining turns synchronously.
