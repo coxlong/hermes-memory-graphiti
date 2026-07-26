@@ -256,7 +256,20 @@ class GraphitiMemoryProvider(MemoryProvider):
         if self._openai_api_key:
             os.environ.setdefault("OPENAI_API_KEY", self._openai_api_key)
 
+        logger.info("Graphiti config loaded: host=%s:%d db=%s group_id=%s",
+                     self._falkordb_host, self._falkordb_port,
+                     self._falkordb_database, self._group_id)
+        logger.info("Graphiti LLM: provider=%s model=%s base_url=%s",
+                     self._llm_provider, self._llm_model or "(default)",
+                     self._llm_base_url or "(default)")
+        logger.info("Graphiti memory: mode=%s retain_every=%d debounce=%ds shutdown_timeout=%ds",
+                     self._memory_mode, self._retain_every_n_turns,
+                     self._retain_min_interval_seconds, self._shutdown_timeout)
+        if self._extraction_language_instruction:
+            logger.info("Graphiti extraction language instruction: custom (overridden)")
+
         # Build driver
+        logger.info("Graphiti connecting to FalkorDB...")
         driver = FalkorDriver(
             host=self._falkordb_host,
             port=self._falkordb_port,
@@ -264,6 +277,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             password=self._falkordb_password or None,
             database=self._falkordb_database,
         )
+        logger.info("Graphiti FalkorDB driver created")
 
         # Build LLM client — use OpenAIGenericClient for OpenAI-compatible APIs
         # (DeepSeek, vLLM, Ollama, etc.) with json_object structured output fallback.
@@ -278,6 +292,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             config=llm_config,
             structured_output_mode="json_object",
         )
+        logger.info("Graphiti LLM client created (OpenAIGenericClient, json_object mode)")
 
         # Build embedder
         embedder_config = OpenAIEmbedderConfig(
@@ -292,12 +307,7 @@ class GraphitiMemoryProvider(MemoryProvider):
             llm_client=llm_client,
             embedder=embedder,
         )
-
-        logger.info(
-            "Graphiti initialized: host=%s:%d db=%s provider=%s mode=%s auto_retain=%s",
-            self._falkordb_host, self._falkordb_port, self._falkordb_database,
-            self._llm_provider, self._memory_mode, self._auto_retain,
-        )
+        logger.info("Graphiti instance created")
 
         # Build indices on init (idempotent — skips if already exist)
         try:
