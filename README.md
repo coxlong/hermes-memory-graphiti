@@ -4,49 +4,65 @@ Graphiti memory provider for Hermes Agent — temporal knowledge graph memory vi
 
 ## What it does
 
-Records every conversation turn as an **episode** in [Graphiti](https://github.com/getzep/graphiti), a temporal knowledge graph engine. Graphiti extracts entities, relationships, and tracks when facts were established and changed — so Hermes can answer "when did X change?" and "what did the user say about Y last week?"
+Records every conversation turn as an **episode** in [Graphiti](https://github.com/getzep/graphiti), a temporal knowledge graph engine. Graphiti extracts entities, relationships, and tracks when facts were established and changed.
 
 ## Requirements
 
-- **FalkorDB** running (localhost:6379 by default)
+- **FalkorDB** running with cppjieba Chinese tokenizer
   ```bash
-  docker run -p 6379:6379 falkordb/falkordb:latest
+  docker run -p 6379:6379 ghcr.io/coxlong/falkordb:zh-jieba
   ```
-- **OpenAI API key** (for entity/edge extraction and embeddings)
+- **OpenAI-compatible API** (for entity/edge extraction and embeddings)
 - Python 3.10+
 
 ## Install
 
 ```bash
-pip install hermes-memory-graphiti
+git clone https://github.com/coxlong/hermes-memory-graphiti.git ~/.hermes/plugins/graphiti
 ```
 
 ## Setup
+
+Run the interactive setup:
 
 ```bash
 hermes memory setup
 # Select "graphiti" when prompted
 ```
 
-Or configure manually in `$HERMES_HOME/graphiti/config.json`:
+Or configure manually.
+
+### `~/.hermes/graphiti/config.json`
 
 ```json
 {
   "falkordb_host": "localhost",
   "falkordb_port": 6379,
   "falkordb_database": "default_db",
-  "llm_provider": "openai",
+  "llm_provider": "openai_compatible",
+  "llm_base_url": "https://api.openai.com/v1",
   "llm_model": "gpt-4o-mini",
   "memory_mode": "hybrid",
   "auto_retain": true
 }
 ```
 
-Secrets go in `$HERMES_HOME/.env`:
+### `~/.hermes/.env`
 
 ```bash
 GRAPHITI_OPENAI_API_KEY=sk-...
 GRAPHITI_FALKORDB_PASSWORD=...
+```
+
+## Chinese extraction language
+
+Override the default English extraction instruction so entities and facts are output in Chinese:
+
+```bash
+jq --arg inst \
+  "Any extracted information should be returned in the same language as it was written in. Only output Chinese text when the user has written full sentences or phrases in Chinese. Otherwise, output Chinese." \
+  '.extraction_language_instruction = $inst' \
+  ~/.hermes/graphiti/config.json > /tmp/cfg.json && mv /tmp/cfg.json ~/.hermes/graphiti/config.json
 ```
 
 ## Memory modes
@@ -65,16 +81,19 @@ GRAPHITI_FALKORDB_PASSWORD=...
 | `GRAPHITI_FALKORDB_PORT` | FalkorDB port | `6379` |
 | `GRAPHITI_FALKORDB_PASSWORD` | FalkorDB password | — |
 | `GRAPHITI_FALKORDB_DATABASE` | FalkorDB database name | `default_db` |
-| `GRAPHITI_OPENAI_API_KEY` | OpenAI API key | — |
-| `GRAPHITI_LLM_PROVIDER` | LLM provider | `openai` |
-| `GRAPHITI_LLM_MODEL` | LLM model | — |
-| `GRAPHITI_LLM_BASE_URL` | Custom LLM endpoint URL | — |
+| `GRAPHITI_OPENAI_API_KEY` | API key for extraction + embeddings | — |
+| `GRAPHITI_LLM_PROVIDER` | `openai` / `openai_compatible` / `anthropic` / ... | `openai` |
+| `GRAPHITI_LLM_MODEL` | Model for entity extraction | provider default |
+| `GRAPHITI_LLM_BASE_URL` | Custom LLM endpoint | — |
+| `GRAPHITI_EMBEDDING_MODEL` | Embedding model | provider default |
 | `GRAPHITI_MEMORY_MODE` | `context` / `tools` / `hybrid` | `hybrid` |
-| `GRAPHITI_AUTO_RETAIN` | Auto-retain turns as episodes | `true` |
+| `GRAPHITI_RECALL_MAX_TOKENS` | Max tokens for prefetch recall | `4096` |
 
 ## How it works
 
-1. **sync_turn** — each conversation turn is enqueued as a job and persisted to Graphiti as an episode on a background writer thread (non-blocking).
+1. **sync_turn** — each conversation turn is buffered. When the turn counter hits `retain_every_n_turns` (default 10) or the debounce timer fires (default 300s), buffered turns are flushed to Graphiti as an episode on a background writer thread. Non-blocking.
 2. **queue_prefetch** — after each turn, a background thread searches Graphiti for memories relevant to the latest user query.
 3. **prefetch** — the cached search results are injected into the system prompt before the next API call.
-4. **graphiti_search** — the agent can also actively search the knowledge graph for additional context.
+4. **on_pre_compress** — flushes any pending turns before the context engine compresses older messages, preventing data loss.
+5. **on_session_end** — synchronously extracts the final batch of turns when the session ends.
+6. **graphiti_search** — the agent can actively search the knowledge graph (bm25 / semantic / hybrid).

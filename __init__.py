@@ -393,7 +393,7 @@ class GraphitiMemoryProvider(MemoryProvider):
         # Safety net: if on_session_end was not called before shutdown (edge
         # case — test teardown, force kill, etc.), extract remaining turns
         # synchronously so no data is lost.
-        if self._session_turns:
+        if self._graphiti is not None and self._session_turns:
             content = "\n".join(list(self._session_turns))
             self._session_turns = []
             num_turns = content.count("\n") + 1
@@ -467,6 +467,8 @@ class GraphitiMemoryProvider(MemoryProvider):
         if self._memory_mode == "tools":
             return
         if self._shutting_down.is_set():
+            return
+        if self._graphiti is None:
             return
         if len(query) > _DEFAULT_MAX_INPUT_CHARS:
             query = query[:_DEFAULT_MAX_INPUT_CHARS]
@@ -728,6 +730,8 @@ class GraphitiMemoryProvider(MemoryProvider):
         """
         if self._shutting_down.is_set():
             return
+        if self._graphiti is None:
+            return
         self._cancel_debounce_timer()
         if not self._session_turns:
             return
@@ -769,6 +773,8 @@ class GraphitiMemoryProvider(MemoryProvider):
         round-trip.
         """
         if self._shutting_down.is_set():
+            return
+        if self._graphiti is None:
             return
         self._cancel_debounce_timer()
         if not self._session_turns:
